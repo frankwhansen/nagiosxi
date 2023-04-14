@@ -1,0 +1,231 @@
+#!/usr/bin/perl
+##########################################################################
+##
+## Name:    check_DB_connections_V2.pl
+##
+## Purpose: Monitor DB connections.
+##
+##
+## History: 07-14-2016
+##
+## Author:  Marcus.Rochelle@landisgyr.com, stanley.harp@landisgyr.com
+##          sidney.kline@landisgyr.com
+## Prereqs:
+##
+##########################################################################
+
+## Revisions
+
+## 07-14-2016 Created from script template check_collector_perf.pl.
+#             harps/sharp - Addition of Active/Inactive percentage
+#                           and connection count for all users,
+#                           as well as state change correction, add
+#                           correct calls to use $ERRORS
+## 07-31-2016 mrochelle Modifying for new DB server lgexdbs2 and the optional use of service_name vs CID in connect string.
+## 11-07-2016 mrochelle Increased default alarm thresholds for check_DB_connections.pl to lower noise. CAS-268416-V8H6P1
+## 01-09-2017 mrochelle CAS-306373-N8C8L0 added support for NSSBSP.
+## 04-11-2017 mrochelle CAS-310953-R6Y1K9 minor correction to output metrics to indicate counts and percents.
+## 01-11-2019 mrochelle RFC-029976 NSP - USC - Prod - Migration to IAD. Increase warning thresholds.
+## 01-25-2019 mrochelle RFC-030157 MCI/IAD - UE - USC - Prod - Migration to IAD (UE/AMIL/LG/BEC/MOB).
+## 11-16-2020 skline Modified for suttcc and suzzcc
+## 03-14-2022 skline Adapted from checkDB_cxonnections.pl and modified to use processes count as alert trigger per DBA Nishu Jain.
+######
+
+#use strict;
+use Monitoring::Plugin;
+use DBI;
+use Time::HiRes;
+use Time::HiRes qw/gettimeofday/;
+use lib  "/usr/local/nagios/libexec" ;
+use utils qw(%ERRORS &print_revision &support &usage );
+my $str_time = gettimeofday();
+
+use vars qw($c $n @details $max_procs $current_procs $proc_limit $details $totalcnt @r $r $m @m $msg $msg2 $SQL $SQL1 $SQL2);
+
+my $ocperf = 0;
+my $ORACLE_HOME = "/usr/lib/oracle/12.2/client64";
+my $ORACLE_SID="orcl";
+
+$ENV{ORACLE_HOME}=$ORACLE_HOME;
+$ENV{ORACLE_SID}=$ORACLE_SID;
+#$ENV{PATH}="$ORACLE_HOME/bin";
+$ENV{LD_LIBRARY_PATH}="$ORACLE_HOME/lib";
+$ENV{TNS_ADMIN}="/home/nagios/oracle";
+
+#Common Directories
+
+(my $MyName = $0) =~ s:^.*/(.*):$1:;               # name of script w/o path
+my $ver = "03.30.2022.1915";
+
+my $np = Monitoring::Plugin->new(
+  shortname =>"$MyName",
+  version => "$ver",
+  #timeout => 60,
+  usage => "Usage: %s [ -H <DB IP_Address> -S <sid> -w <process cnt for WARN> -c <process cnt for CRITICAL> ]",
+);
+
+$np->add_arg(
+  spec => "H=s",
+  help => "-H = IP Addr or Host Name of system to connect with DB.",
+  required => 1,
+);
+
+$np->add_arg(
+  spec => "S=s",
+  help => "-S = DB SID identifier.",
+  required => 1,
+);
+
+$np->add_arg(
+  spec => "U=s",
+  help => "-U = DB UserID for Authentication.",
+  required => 0,
+);
+
+$np->add_arg(
+  spec => "P=s",
+  help => "-P = DB Password for Authentication.",
+  required => 0,
+);
+
+$np->add_arg(
+  spec => "w=s",
+  help => "-w = Warning threshold for prcess count.",
+  required => 0,
+);
+
+$np->add_arg(
+  spec => "c=s",
+  help => "-c = Critical threshold for process count.",
+  required => 0,
+);
+
+$np->getopts;
+
+$n=0;$cnt=0;
+$current_procs=0;$max_procs=0;$proc_limit=0;$totalcnt=0;$total=0;$INApercentage=0;$ACTpercentage=0;
+my $dbi;
+my $hostaddr = $np->opts->H;
+my $sid = $np->opts->S;
+
+my $warn = $np->opts->w; unless ($warn) { $warn = 1700; }
+my $critical = $np->opts->c; unless ($critical) { $critical = 1800; }
+my $userid = $np->opts->U; unless ( $userid ) { $userid = "nagios"; }
+my $passwd = $np->opts->P; unless ( $passwd ) { $passwd = "********"; }
+my $verbose = $np->opts->verbose;
+print "$hostaddr\n$sid\n$warn\n$critical\n$userid\n$passwd\n" if $verbose;
+
+if (($sid =~ /JEWCC|jewcc|JETTCC|NGDMDM|ngdmdm|NSSBS|nssbs|PSEG|pseg/) && ($sid !~ /PSEGYYL|psegyyl/)) { $passwd = "n0cmonitor"; }
+if ($sid =~ /UICC|uicc|WSCC|wscc/) { $passwd = "nocm0nitor"; }
+
+my $tzone;
+if ($sid =~ /JECC|jecc|JEWCC|jewcc|JETTCC|IPCC|ipcc|NGDMDM|ngdmdm|PSEG|pseg|UICC|uicc/) { $tzone = "America/New_York"; }
+elsif ($sid =~ /SUCC|succ|SUTTCC|suttcc|SUZZCC|suzzcc/) { $tzone = "America/Denver"; }
+elsif ($sid =~ /PPCC|ppcc/) { $tzone = "America/Los_Angeles"; }
+else  { $tzone = "America/Chicago"; }
+&pdata;
+my $pluginstate = "UNKNOWN";
+print "Defined     Arguments\n
+DB Host:    $hostaddr
+SID:        $sid
+Warning:    $warn
+Critical:   $critical
+UserID:     $userid
+Passwd:     $passwd
+Time Zone:  $tzone
+\n" if ($verbose);
+
+sub pdata {
+  $dbi = DBI->connect("dbi:Oracle:$sid", "$userid", "$passwd") or die(DBI->errstr()."\n");
+  $SQL .= "select current_utilization, max_utilization, initial_allocation, limit_value ";
+  $SQL .= "FROM v\$resource_limit ";
+  $SQL .= "WHERE resource_name = 'processes' ";
+
+  my $sth = $dbi->prepare($SQL) or die(DBI->errstr());
+  $sth->execute();
+  while ( @r = $sth->fetchrow()) {
+    print "@r\n" if $verbose;
+    $current_procs = $r[0];
+    $max_procs = $r[1]; # Maximum processes utilization
+    $proc_limit = $r[3]; # Processes limit
+    # $warn = int($r[2] * .75); # Integer part of 75% of process initial_allocation
+    # $critical = int($r[2] * .80); # Integer part of 80% of process initial_allocation
+  }
+    $sth->finish();
+    $dbi->disconnect();
+} # End Subroutine pdata
+
+sub pqdata {
+  #Modified to use TNSNAMES.ORA to determine DB. 02-20-2019
+  $dbi = DBI->connect("dbi:Oracle:$sid", "$userid", "$passwd") or die(DBI->errstr()."\n");
+  $SQL1 .= "select count(a.status) ";
+  $SQL1 .= "from gv\$session a, gv\$process b ";
+  $SQL1 .= "where a.paddr = b.addr ";
+  $SQL1 .= "and a.inst_id = b.inst_id ";
+  $SQL1 .= "and a.username is not null ";
+  $SQL1 .= "group by a.status ";
+  $SQL1 .= "order by a.status ";
+
+  my $sth = $dbi->prepare($SQL1) or die(DBI->errstr());
+  $sth->execute();
+  while ( my $x = $sth->fetchrow()) {
+    print "$x\n" if $verbose;
+    push @msg2,$x;
+    $total+=$x;
+  }
+  $INApercentage = sprintf "%.2f",($msg2[1]/$total)*100;
+  $ACTpercentage = sprintf "%.2f",($msg2[0]/$total)*100;
+  $sth->finish();
+  $dbi->disconnect();
+} # End Subroutine pqdata
+
+sub qdata {
+  #Modified to use TNSNAMES.ORA to determine DB. 02-20-2019
+  $dbi = DBI->connect("dbi:Oracle:$sid", "$userid", "$passwd") or die(DBI->errstr()."\n");
+  $SQL2 .= "select count(a.status),a.username ";
+  $SQL2 .= "FROM gv\$session a, gv\$process b ";
+  $SQL2 .= "WHERE a.paddr = b.addr ";
+  $SQL2 .= "AND a.inst_id = b.inst_id ";
+  $SQL2 .= "AND a.username is not null ";
+  $SQL2 .= "group by a.username,a.status ";
+  $SQL2 .= "order by a.status,a.username ";
+
+  my $sth = $dbi->prepare($SQL2) or die(DBI->errstr());
+  $sth->execute();
+  while ( @r = $sth->fetchrow()) {
+    print "@r\n" if $verbose;
+    unless ($r[1]) { $r[1]="Null"; }
+    $details[$n] = "$r[2] \t  $r[1] \t  $r[0]\n"; $n++;
+    $totalcnt = ($totalcnt + $r[0]);
+  }
+  $sth->finish();
+  $dbi->disconnect();
+} # End Subroutine qdata
+
+sub notes {
+  $m[$c] = "Oracle checks are for metrics primarily. If processes count alerting or multiple Oracle monitors are alerting, consult with the On Call for recommended action.\n";
+  $c++;
+}
+
+########
+# Main #
+########
+$c=1;
+#Get sessions status.
+&pqdata;&qdata;
+print "Current Processes: $current_procs\n" if $verbose;
+print "Maximum Processes: $max_procs\n" if $verbose;
+print "Process Limit: $proc_limit\n" if $verbose;
+print "Total number of Active Connections: $msg2[0] Inactive: $msg2[1]\n" if $verbose;
+print "Total Session Connections: $totalcnt\n@detail\n" if $verbose;
+if ($current_procs >= $critical) { $state = $ERRORS{'CRITICAL'}; &notes; }
+elsif ($current_procs >= $warn) { $state = $ERRORS{'WARNING'};  &notes; }
+else { $state = $ERRORS{'OK'}; }
+$m[0]= "Total Session Connections: $totalcnt\n@details\n";
+my $end_time = gettimeofday();
+my $chk_dur = ($end_time - $str_time); $chk_dur = sprintf("%.3f", $chk_dur);
+$m[$c]= "\nCheck Duration: $chk_dur seconds.\n"; $c++;
+$m[$c]= "$MyName rel. $ver\n"; $c++;
+my $msg= " @m | Processes=$current_procs;$warn;$critical Sessions=$totalcnt Active=$msg2[0] Inactive=$msg2[1] Active%=$ACTpercentage Inactive%=$INApercentage Chk_Resp=$chk_dur"."s";
+$np->nagios_exit($state, $msg);
+

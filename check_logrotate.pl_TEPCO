@@ -1,0 +1,281 @@
+#!/usr/bin/perl
+#
+# Author: 
+# Marcus Rochelle
+#
+# Description:
+# This plugin will ssh to a system cm and perform a service process check.
+#
+# Shortname will be the name of the NagiosXI plugin.
+# Critical will be what causes the check to become critical.
+# Device will be the network equipment to run this plugin against.
+#
+# 09-13-2012 Revised by Marcus Rochelle
+# 06-23-2014 mrochelle Added self healing capability by recycling RSA App Pool.
+# 04-02-2015 Revised for chk_je_cc_tokenV3.pl.
+# 04-03-2015 Added SID to filename.
+# 04-07-2015 Revised error message and recommended action.
+# 10-17-2016 mrochelle CAS-268416-V8H6P1 - Revised script for CC version 6.5+.
+#
+#####################
+
+use Monitoring::Plugin;
+use DBI;
+use Time::HiRes;
+use Time::HiRes qw/gettimeofday/;
+my $ocperf = 0;
+my $ORACLE_HOME = "/usr/lib/oracle/12.2/client64";
+my $ORACLE_SID="orcl";
+
+$ENV{ORACLE_HOME}=$ORACLE_HOME;
+$ENV{ORACLE_SID}=$ORACLE_SID;
+$ENV{PATH}="$ORACLE_HOME/bin";
+$ENV{LD_LIBRARY_PATH}="$ORACLE_HOME/lib";
+
+my $str_time = gettimeofday();
+($MyName = $0) =~ s:^.*/(.*):$1:;               # name of script w/o path
+my $ver = "10.17.2016.0850";
+
+# Define the plugin and usage.
+$np = Monitoring::Plugin->new(
+  shortname =>"$MyName ",
+  usage => "Usage: %s [ -H <DB host ip> -S <DB sid> --ccaddr <CC APP Server ip> --Collector <Collector Name> --Pcmd <Collector Ping Cmd> -s <seconds> ]\n$MyName $ver", 
+);
+
+# Add command line arg 1
+$np->add_arg(
+  spec => "H=s",
+  help => "-H = IP Addr or Host Name of system to connect with DB.",
+  required => 1,
+);
+
+# Add command line arg 2
+  $np->add_arg(
+  spec => "ccaddr=s",
+  help => "--ccaddr=CC Server\n The Command Center Server IP Address.",
+  required => 1,
+);
+
+# Add command line arg 3
+  $np->add_arg(
+  spec => "Collector=s",
+  help => "--Collector=COLLECTOR\n Collector to use for testing if RSA cycle resolved the problem.",
+  required => 1,
+);
+
+# Add command line arg 4
+  $np->add_arg(
+  spec => "Pcmd=s",
+  help => "--Pcmd=PCMD\n Collector Ping Command to use for testing if RSA cycle resolved the problem.",
+  required => 1,
+);
+
+# Add command line arg 5
+ $np->add_arg(
+  spec => "s=s",
+  help => "-s=SECONDS\n Minimum time in seconds before another recycle is allowed.",
+  required => 0,
+);
+
+$np->add_arg(
+  spec => "S=s",
+  help => "-S = DB SID identifier.",
+  required => 1,
+);
+
+$np->add_arg(
+  spec => "U=s",
+  help => "-U = DB UserID for Authentication.",
+  required => 0,
+);
+
+$np->add_arg(
+  spec => "P=s",
+  help => "-P = DB Password for Authentication.",
+  required => 0,
+);
+
+$np->getopts;
+my $hostaddr = $np->opts->H;
+my $sid = $np->opts->S;
+my $ccaddr = $np->opts->ccaddr;
+my $collector = $np->opts->Collector;
+my $pcmd = $np->opts->Pcmd;
+my $tdm = $np->opts->s;    unless ( $tdm )    { $tdm    = 3600; }
+my $userid = $np->opts->U; unless ( $userid ) { $userid = "nagios"; }
+my $passwd = $np->opts->P; unless ( $passwd ) { $passwd = "***********"; }
+my $verbose = $np->opts->verbose;
+
+print "Defined     Arguments\n
+DB Host:      $hostaddr
+SID:          $sid
+Collector:    $collector
+Ping Cmd:     $pcmd
+UserID:       $userid
+Passwd:       $passwd
+Minimum secs: $tdm
+\n" if ($verbose);
+#####################################
+##### subs
+
+##############################
+# Update Timestamp Procedure #
+##############################
+  sub updtime {
+  $timestamp=time;
+  }
+
+##############################
+# Last Time RSA was Recycled #
+##############################
+  sub rsat {
+  &updtime;
+  my $filename="/tmp/$MyName.$sid";
+  if ( -e $filename ) {
+    open(RSATIME, "+<$filename") || die "Can't open $filename: $!\n";
+    $lrsatime = <RSATIME>;     # If log already exists, read time when RSA was last cycled.
+  } else { $lrsatime = 0; }
+  close RSATIME;
+  $td = $timestamp - $lrsatime;
+  $cts = `date \-d \@$lrsatime`; chomp $cts;
+  }
+
+#####################################
+# Update Last Time RSA was Recycled #
+#####################################
+  sub rsau {
+  &updtime;
+  my $filename="/tmp/$MyName.$sid";
+  open(RSATIME, "+>$filename") || die "Can't open $filename: $!\n";
+  print RSATIME "$timestamp";  # Update RSA Log with new timestamp.
+  close RSATIME;
+  }
+
+##################
+# Main Procedure #
+##################
+#$CMD = "/home/nagios/cc_token_error_xi.pl";
+#$SHELL = "/usr/bin/ssh";
+$USER1 = "/usr/local/nagios/libexec";
+$status=-1;
+
+#Run Token Error Check
+sub querydb {
+print "Starting querydb procedure!\n" if $verbose;
+#Token not present error
+##Connect to NDB
+  if ($sid =~ /\w\w\w\wP/) { $dbi = DBI->connect("dbi:Oracle:host=$hostaddr;service_name=$sid", "$userid", "$passwd") or die(DBI->errstr()."\n"); }
+  else                     { $dbi = DBI->connect("dbi:Oracle:host=$hostaddr;sid=$sid", "$userid", "$passwd") or die(DBI->errstr()."\n"); }
+  my $SQL = "SELECT el.logtime, ";
+  $SQL .= "  el.description ";
+  $SQL .= "FROM centralservices.ERRORLOG el ";
+  $SQL .= "INNER JOIN centralservices.errortypes et ";
+  $SQL .= "ON el.errortypeid = et.errortypeid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.endpoints e ";
+  $SQL .= "ON el.endpointid = e.endpointid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.collectors c ";
+  $SQL .= "ON el.spuid = c.collectorid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.meters m ";
+  $SQL .= "ON e.meterid      = m.meterid ";
+  $SQL .= "WHERE el.logtime >= new_time((sysdate - 15/1440),'CDT','EDT') ";
+  $SQL .= "AND el.source     = 'SignatureHelper' ";
+  $SQL .= "AND el.message LIKE '%CKR_TOKEN_NOT_PRESENT%' ";
+  $SQL .= "ORDER BY el.logtime DESC ";
+  my $sth = $dbi->prepare($SQL) or die(DBI->errstr());
+  $sth->execute();
+   while ( my @r = $sth->fetchrow()) {
+       print "@r\n" if $verbose;
+       if ($c < 1) { push @lastentry, "@r"; } #Return the latest error log entry
+       if ($c < 66) { push @data, "@r\n"; }   #Return up to 66 error entry lines
+       $c++;
+   }#end while
+   if ($c > 0) { $token_err="yes"; }
+  $sth->finish();
+  $dbi->disconnect();
+
+#Connect to NDB
+##Some Problem with Token
+  if ($sid =~ /\w\w\w\wP/) { $dbi = DBI->connect("dbi:Oracle:host=$hostaddr;service_name=$sid", "$userid", "$passwd") or die(DBI->errstr()."\n"); }
+  else                     { $dbi = DBI->connect("dbi:Oracle:host=$hostaddr;sid=$sid", "$userid", "$passwd") or die(DBI->errstr()."\n"); }
+  $SQL  = "SELECT el.logtime, ";
+  $SQL .= "  el.description ";
+  $SQL .= "FROM centralservices.ERRORLOG el ";
+  $SQL .= "INNER JOIN centralservices.errortypes et ";
+  $SQL .= "ON el.errortypeid = et.errortypeid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.endpoints e ";
+  $SQL .= "ON el.endpointid = e.endpointid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.collectors c ";
+  $SQL .= "ON el.spuid = c.collectorid ";
+  $SQL .= "LEFT OUTER JOIN centralservices.meters m ";
+  $SQL .= "ON e.meterid       = m.meterid ";
+  $SQL .= "WHERE el.logtime >= new_time((sysdate - 15/1440),'CDT','EDT') ";
+  $SQL .= "AND el.source      = 'SignatureHelper' ";
+  $SQL .= "AND el.message LIKE '%CKR%' ";
+  $SQL .= "ORDER BY el.logtime DESC ";
+  my $sth = $dbi->prepare($SQL) or die(DBI->errstr());
+  $sth->execute();
+   while ( my @r = $sth->fetchrow()) {
+       print "@r\n" if $verbose;
+       if ($c < 1) { push @lastentry, "@r"; } #Return the latest error log entry
+       if ($c < 66) { push @data, "@r\n"; }   #Return up to 66 error entry lines
+       $c++;
+   }#end while
+   if ($c > 0) { push @data, "Some Problem with Token Query Results\n"; }
+  $sth->finish();
+  $dbi->disconnect();
+
+} #end sub querydb
+######################
+# End of Subroutines #
+######################
+
+  $c=0;
+
+  #Check CC database for token related error.
+  &querydb;
+  $ec = $c; #error count (ec)
+  $c=0;
+  if ($ec > 0) {
+     #Token related errors found
+     $m[$c] = "@lastentry. $ec log entries.\n"; $c++;
+     #$m[$c] = "Please contact PQL support to recycle the RSA service to resolve issue.\n"; $c++;
+     $m[$c] = "Error Detail:\n"; $c++;
+     if ($token_err) { $m[$c] = "Token Not Present Error Query Results\n"; $c++; }
+     $m[$c] = "@data\n"; $c++;
+  } else {
+     #CC TOKEN OK
+     $m[$c] = "CC TOKEN OK\n"; $c++;
+     #$m[$c] = "Log Detail:\n"; $c++;
+     #$m[$c] = "@data\n"; $c++;
+  }
+
+  $alive = "@m\n"; print "Returned Error Log Data\n$alive\n" if ($verbose);
+  if ( $alive =~ m/CC TOKEN OK/ ) {
+     $pluginstate = "OK"; $status=1; }
+  elsif ( $alive =~ m/CKR|Token not present|Error|ERROR||error|fail/ ) {
+     $status=0; #Token error problem detected 
+     $m[$c] = "Recyling the RSA App Pool\n"; print "$m[$c]\n" if ($verbose); $c++;
+     &rsat; # Determine time since last RSA recycle
+     if ( $td > $tdm ) { $alive = `$USER1/check_nrpe -H $ccaddr -p 5666 -t 60 -c Recycle_RSA_App_Pool`; &rsau; }
+     else              { $td=int($td/60); $tdm=int($tdm/60); $alive = "Time since last recycle is $td mins and under allowable threshold of $tdm mins.\n"; }
+   # RSA was successfully recycled
+     if ( $alive =~ m/successfully recycled/ ) {
+        $m[$c] = "Recycling the RSA App Pool was Successful\nRunning a Collector Ping\n";
+        print "$m[$c]\n" if ($verbose); $c++; 
+        $ping = `$USER1/$pcmd -c $Collector -w 60 -t 120|head -2`; #$ping = " ";
+        # Check if problem resolved after recycle with collector ping 
+        if ( $ping =~ m/OK - Ping/ ) { 
+           $pluginstate = "WARNING"; $m[$c]= "Nagios detected a Token problem and recycling the RSA App Pool has resolved the problem. No further action is required.\n$ping\n"; $c++; }
+        else { $pluginstate = "CRITICAL"; $m[$c]= "Nagios detected a Token problem and Recycle of the RSA App Pool did not resolve the problem! Please notify the appropriate support.\n$ping\n"; $c++; }
+     }
+     # RSA was recently recycled so no new recycle was allowed 
+     elsif ( $alive =~ m/Time since last/ ) { $pluginstate = "CRITICAL"; $m[$c]= "Token problem and RSA was recently recycled at $cts! Re-run this check and if it fails, notify the appropriate support.\n$alive\n"; $c++; }
+     else  { $pluginstate = "CRITICAL"; $m[$c]= "Nagios detected a Token problem and Recycle of the RSA App Pool failed! Please notify the appropriate support.\n$alive\n"; $c++; }
+  }
+  else  { $pluginstate = "UNKNOWN"; $m[$c]= "$alive\n"; $c++; }
+  my $end_time = gettimeofday();
+  my $chk_dur = ($end_time - $str_time); $chk_dur = sprintf("%.3f", $chk_dur);
+  $m[$c]= "Check Duration: $chk_dur seconds.\n"; $c++;
+  $m[$c]= "$MyName rel. $ver\n"; $c++;
+  my $msg= "@m | Status=$status"." Chk_Resp=$chk_dur"."s";
+  $np->nagios_exit($pluginstate, $msg );
