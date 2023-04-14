@@ -1,0 +1,19 @@
+node {
+    stage('Execute Groovy Script') {
+        // Define the Groovy script to be executed
+        def script = '''
+            def greeting = "Hello, Jenkins!"
+            echo greeting
+        '''
+
+        // Run the Groovy script
+        try {
+            // Evaluate the Groovy script
+            eval(script)
+        } catch (Exception e) {
+            // Catch and handle any exceptions that occur during script execution
+            echo "Error executing Groovy script: ${e.getMessage()}"
+            error("Groovy script failed")
+        }
+    }
+}
